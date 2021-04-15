@@ -21,7 +21,7 @@ import (
 	"github.com/tjfoc/gmsm/x509"
 )
 
-const VersionGMSSL = 0x0101 // GM/T 0024-2014
+const VersionGMSSL uint16 = 0x0101 // GM/T 0024-2014
 
 var pemCAs = []struct {
 	name string
@@ -118,8 +118,8 @@ const (
 )
 
 var gmCipherSuites = []*cipherSuite{
-	{GMTLS_SM2_WITH_SM4_SM3, 16, 32, 16, eccGMKA, suiteECDSA, cipherSM4, macSM3, nil},
-	{GMTLS_ECDHE_SM2_WITH_SM4_SM3, 16, 32, 16, ecdheGMKA, suiteECDHE | suiteECDSA, cipherSM4, macSM3, nil},
+	{GMTLS_SM2_WITH_SM4_SM3, 16, 32, 16, eccGMKA, suiteECSign, cipherSM4, macSM3, nil},
+	{GMTLS_ECDHE_SM2_WITH_SM4_SM3, 16, 32, 16, ecdheGMKA, suiteECDHE | suiteECSign, cipherSM4, macSM3, nil},
 }
 
 func getCipherSuites(c *Config) []uint16 {
@@ -140,7 +140,7 @@ func cipherSM4(key, iv []byte, isRead bool) interface{} {
 
 // macSHA1 returns a macFunction for the given protocol version.
 func macSM3(version uint16, key []byte) macFunction {
-	return tls10MAC{hmac.New(sm3.New, key)}
+	return tls10MAC{h:hmac.New(sm3.New, key)}
 }
 
 //used for adapt the demand of finishHash write
@@ -196,6 +196,14 @@ func mutualCipherSuiteGM(have []uint16, want uint16) *cipherSuite {
 		}
 	}
 	return nil
+}
+func (gm *GMSupport) mutualVersionGM(peerVersions []uint16) (uint16, bool) {
+	for _, peerVersion := range peerVersions {
+		if peerVersion == VersionGMSSL {
+			return VersionGMSSL, true
+		}
+	}
+	return 0, false
 }
 
 type GMSupport struct {

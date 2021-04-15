@@ -87,9 +87,11 @@ func clientRun() {
 		ServerName:   "test.example.com",
 		Certificates: []gmtls.Certificate{cert},
 		RootCAs:      certPool,
-		ClientAuth:   gmtls.RequireAndVerifyClientCert,
+		ClientAuth:   gmtls.NoClientCert,
 	})
-	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(creds))
+	timeout, err := time.ParseDuration("100s")
+
+	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(creds), grpc.WithTimeout(timeout))
 	if err != nil {
 		log.Fatalf("cannot to connect: %v", err)
 	}

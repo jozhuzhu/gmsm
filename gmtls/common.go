@@ -24,6 +24,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,14 +37,17 @@ const (
 	VersionTLS10 = 0x0301
 	VersionTLS11 = 0x0302
 	VersionTLS12 = 0x0303
+	VersionTLS13 = 0x0304
 )
 
 const (
 	maxPlaintext      = 16384        // maximum plaintext payload length
 	maxCiphertext     = 16384 + 2048 // maximum ciphertext payload length
+	maxCiphertextTLS13 = 16384 + 256  // maximum ciphertext length in TLS 1.3
 	recordHeaderLen   = 5            // record header length
 	maxHandshake      = 65536        // maximum handshake we support (protocol max is 16 MB)
 	maxWarnAlertCount = 5            // maximum number of consecutive warning alerts
+	maxUselessRecords  = 16           // maximum number of consecutive non-advancing records
 
 	minVersion = VersionGMSSL
 	maxVersion = VersionTLS12
@@ -61,19 +65,23 @@ const (
 
 // TLS handshake message types.
 const (
-	typeHelloRequest       uint8 = 0
-	typeClientHello        uint8 = 1
-	typeServerHello        uint8 = 2
-	typeNewSessionTicket   uint8 = 4
-	typeCertificate        uint8 = 11
-	typeServerKeyExchange  uint8 = 12
-	typeCertificateRequest uint8 = 13
-	typeServerHelloDone    uint8 = 14
-	typeCertificateVerify  uint8 = 15
-	typeClientKeyExchange  uint8 = 16
-	typeFinished           uint8 = 20
-	typeCertificateStatus  uint8 = 22
-	typeNextProtocol       uint8 = 67 // Not IANA assigned
+	typeHelloRequest        uint8 = 0
+	typeClientHello         uint8 = 1
+	typeServerHello         uint8 = 2
+	typeNewSessionTicket    uint8 = 4
+	typeEndOfEarlyData      uint8 = 5
+	typeEncryptedExtensions uint8 = 8
+	typeCertificate         uint8 = 11
+	typeServerKeyExchange   uint8 = 12
+	typeCertificateRequest  uint8 = 13
+	typeServerHelloDone     uint8 = 14
+	typeCertificateVerify   uint8 = 15
+	typeClientKeyExchange   uint8 = 16
+	typeFinished            uint8 = 20
+	typeCertificateStatus   uint8 = 22
+	typeKeyUpdate           uint8 = 24
+	typeNextProtocol        uint8 = 67  // Not IANA assigned
+	typeMessageHash         uint8 = 254 // synthetic message
 )
 
 // TLS compression types.
@@ -82,17 +90,26 @@ const (
 )
 
 // TLS extension numbers
+// TLS extension numbers
 const (
-	extensionServerName          uint16 = 0
-	extensionStatusRequest       uint16 = 5
-	extensionSupportedCurves     uint16 = 10
-	extensionSupportedPoints     uint16 = 11
-	extensionSignatureAlgorithms uint16 = 13
-	extensionALPN                uint16 = 16
-	extensionSCT                 uint16 = 18 // https://tools.ietf.org/html/rfc6962#section-6
-	extensionSessionTicket       uint16 = 35
-	extensionNextProtoNeg        uint16 = 13172 // not IANA assigned
-	extensionRenegotiationInfo   uint16 = 0xff01
+	extensionServerName              uint16 = 0
+	extensionStatusRequest           uint16 = 5
+	extensionSupportedCurves         uint16 = 10 // supported_groups in TLS 1.3, see RFC 8446, Section 4.2.7
+	extensionSupportedPoints         uint16 = 11
+	extensionSignatureAlgorithms     uint16 = 13
+	extensionALPN                    uint16 = 16
+	extensionSCT                     uint16 = 18
+	extensionSessionTicket           uint16 = 35
+	extensionPreSharedKey            uint16 = 41
+	extensionEarlyData               uint16 = 42
+	extensionSupportedVersions       uint16 = 43
+	extensionCookie                  uint16 = 44
+	extensionPSKModes                uint16 = 45
+	extensionCertificateAuthorities  uint16 = 47
+	extensionSignatureAlgorithmsCert uint16 = 50
+	extensionKeyShare                uint16 = 51
+	extensionNextProtoNeg            uint16 = 13172 // not IANA assigned
+	extensionRenegotiationInfo       uint16 = 0xff01
 )
 
 // TLS signaling cipher suite values
@@ -109,7 +126,27 @@ const (
 	CurveP384 CurveID = 24
 	CurveP521 CurveID = 25
 	X25519    CurveID = 29
+	CurveGM   CurveID = 43
 )
+
+// TLS 1.3 Key Share. See RFC 8446, Section 4.2.8.
+type keyShare struct {
+	group CurveID
+	data  []byte
+}
+
+// TLS 1.3 PSK Key Exchange Modes. See RFC 8446, Section 4.2.9.
+const (
+	pskModePlain uint8 = 0
+	pskModeDHE   uint8 = 1
+)
+
+// TLS 1.3 PSK Identity. Can be a Session Ticket, or a reference to a saved
+// session. See RFC 8446, Section 4.2.11.
+type pskIdentity struct {
+	label               []byte
+	obfuscatedTicketAge uint32
+}
 
 // TLS Elliptic Curve Point Formats
 // https://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-9
@@ -140,40 +177,84 @@ const (
 // Signature algorithms (for internal signaling use). Starting at 16 to avoid overlap with
 // TLS 1.2 codepoints (RFC 5246, section A.4.1), with which these have nothing to do.
 const (
-	signaturePKCS1v15 uint8 = iota + 16
-	signatureECDSA
+	signaturePKCS1v15 uint8 = iota + 225
 	signatureRSAPSS
+	signatureECDSA
 	signatureSM2
+	signatureEd25519
 )
 
+// directSigning is a standard Hash value that signals that no pre-hashing
+// should be performed, and that the input should be signed directly. It is the
+// hash function associated with the Ed25519 signature scheme.
+var directSigning crypto.Hash = 0
+
 // supportedSignatureAlgorithms contains the signature and hash algorithms that
-// the code advertises as supported in a TLS 1.2 ClientHello and in a TLS 1.2
+// the code advertises as supported in a TLS 1.2+ ClientHello and in a TLS 1.2+
 // CertificateRequest. The two fields are merged to match with TLS 1.3.
 // Note that in TLS 1.2, the ECDSA algorithms are not constrained to P-256, etc.
 var supportedSignatureAlgorithms = []SignatureScheme{
-	PKCS1WithSHA256,
+	PSSWithSHA256,
 	ECDSAWithP256AndSHA256,
+	Ed25519,
+	PSSWithSHA384,
+	PSSWithSHA512,
+	PKCS1WithSHA256,
 	PKCS1WithSHA384,
-	ECDSAWithP384AndSHA384,
 	PKCS1WithSHA512,
+	ECDSAWithP384AndSHA384,
 	ECDSAWithP521AndSHA512,
 	PKCS1WithSHA1,
 	ECDSAWithSHA1,
+	SM2WITHSM3,
 }
+
+// supportedSignatureAlgorithmsTLS12 contains the signature and hash algorithms
+// that are supported in TLS 1.2, where it is possible to distinguish the
+// protocol version. This is temporary, see Issue 32425.
+var supportedSignatureAlgorithmsTLS12 = []SignatureScheme{
+	PKCS1WithSHA256,
+	ECDSAWithP256AndSHA256,
+	Ed25519,
+	PKCS1WithSHA384,
+	PKCS1WithSHA512,
+	ECDSAWithP384AndSHA384,
+	ECDSAWithP521AndSHA512,
+	PKCS1WithSHA1,
+	ECDSAWithSHA1,
+	SM2WITHSM3,
+}
+
+// helloRetryRequestRandom is set as the Random value of a ServerHello
+// to signal that the message is actually a HelloRetryRequest.
+var helloRetryRequestRandom = []byte{ // See RFC 8446, Section 4.1.3.
+	0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+	0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+	0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+	0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+}
+
+const (
+	// downgradeCanaryTLS12 or downgradeCanaryTLS11 is embedded in the server
+	// random as a downgrade protection if the server would be capable of
+	// negotiating a higher version. See RFC 8446, Section 4.1.3.
+	downgradeCanaryTLS12 = "DOWNGRD\x01"
+	downgradeCanaryTLS11 = "DOWNGRD\x00"
+)
 
 // ConnectionState records basic TLS details about the connection.
 type ConnectionState struct {
 	Version                     uint16                // TLS version used by the connection (e.g. VersionTLS12)
 	HandshakeComplete           bool                  // TLS handshake is complete
 	DidResume                   bool                  // connection resumes a previous TLS connection
-	CipherSuite                 uint16                // cipher suite in use (TLS_RSA_WITH_RC4_128_SHA, ...)
+	CipherSuite                 uint16                // cipher suite in use (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, ...)
 	NegotiatedProtocol          string                // negotiated next protocol (not guaranteed to be from Config.NextProtos)
 	NegotiatedProtocolIsMutual  bool                  // negotiated protocol was advertised by server (client side only)
 	ServerName                  string                // server name requested by client, if any (server side only)
 	PeerCertificates            []*x509.Certificate   // certificate chain presented by remote peer
 	VerifiedChains              [][]*x509.Certificate // verified chains built from PeerCertificates
-	SignedCertificateTimestamps [][]byte              // SCTs from the server, if any
-	OCSPResponse                []byte                // stapled OCSP response from server, if any
+	SignedCertificateTimestamps [][]byte              // SCTs from the peer, if any
+	OCSPResponse                []byte                // stapled OCSP response from peer, if any
 
 	// ekm is a closure exposed via ExportKeyingMaterial.
 	ekm func(label string, context []byte, length int) ([]byte, error)
@@ -183,14 +264,14 @@ type ConnectionState struct {
 	// because resumption does not include enough context (see
 	// https://mitls.org/pages/attacks/3SHAKE#channelbindings). This will
 	// change in future versions of Go once the TLS master-secret fix has
-	// been standardized and implemented.
+	// been standardized and implemented. It is not defined in TLS 1.3.
 	TLSUnique []byte
 }
 
 // ExportKeyingMaterial returns length bytes of exported key material in a new
-// slice as defined in https://tools.ietf.org/html/rfc5705. If context is nil,
-// it is not used as part of the seed. If the connection was set to allow
-// renegotiation via Config.Renegotiation, this function will return an error.
+// slice as defined in RFC 5705. If context is nil, it is not used as part of
+// the seed. If the connection was set to allow renegotiation via
+// Config.Renegotiation, this function will return an error.
 func (cs *ConnectionState) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
 	return cs.ekm(label, context, length)
 }
@@ -207,37 +288,58 @@ const (
 	RequireAndVerifyClientCert
 )
 
+// requiresClientCert reports whether the ClientAuthType requires a client
+// certificate to be provided.
+func requiresClientCert(c ClientAuthType) bool {
+	switch c {
+	case RequireAnyClientCert, RequireAndVerifyClientCert:
+		return true
+	default:
+		return false
+	}
+}
+
 // ClientSessionState contains the state needed by clients to resume TLS
 // sessions.
 type ClientSessionState struct {
 	sessionTicket      []uint8               // Encrypted ticket used for session resumption with server
 	vers               uint16                // SSL/TLS version negotiated for the session
 	cipherSuite        uint16                // Ciphersuite negotiated for the session
-	masterSecret       []byte                // MasterSecret generated by client on a full handshake
+	masterSecret       []byte                // Full handshake MasterSecret, or TLS 1.3 resumption_master_secret
 	serverCertificates []*x509.Certificate   // Certificate chain presented by the server
 	verifiedChains     [][]*x509.Certificate // Certificate chains we built for verification
+	receivedAt         time.Time             // When the session ticket was received from the server
+
+	// TLS 1.3 fields.
+	nonce  []byte    // Ticket nonce sent by the server, to derive PSK
+	useBy  time.Time // Expiration of the ticket lifetime as set by the server
+	ageAdd uint32    // Random obfuscation factor for sending the ticket age
 }
 
 // ClientSessionCache is a cache of ClientSessionState objects that can be used
 // by a client to resume a TLS session with a given server. ClientSessionCache
 // implementations should expect to be called concurrently from different
-// goroutines. Only ticket-based resumption is supported, not SessionID-based
-// resumption.
+// goroutines. Up to TLS 1.2, only ticket-based resumption is supported, not
+// SessionID-based resumption. In TLS 1.3 they were merged into PSK modes, which
+// are supported via this interface.
 type ClientSessionCache interface {
 	// Get searches for a ClientSessionState associated with the given key.
 	// On return, ok is true if one was found.
 	Get(sessionKey string) (session *ClientSessionState, ok bool)
 
-	// Put adds the ClientSessionState to the cache with the given key.
+	// Put adds the ClientSessionState to the cache with the given key. It might
+	// get called multiple times in a connection if a TLS 1.3 server provides
+	// more than one session ticket. If called with a nil *ClientSessionState,
+	// it should remove the cache entry.
 	Put(sessionKey string, cs *ClientSessionState)
 }
 
 // SignatureScheme identifies a signature algorithm supported by TLS. See
-// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.3.
+// RFC 8446, Section 4.2.3.
 type SignatureScheme uint16
 
+
 const (
-	PKCS1WithSHA1   SignatureScheme = 0x0201
 	PKCS1WithSHA256 SignatureScheme = 0x0401
 	PKCS1WithSHA384 SignatureScheme = 0x0501
 	PKCS1WithSHA512 SignatureScheme = 0x0601
@@ -250,7 +352,11 @@ const (
 	ECDSAWithP384AndSHA384 SignatureScheme = 0x0503
 	ECDSAWithP521AndSHA512 SignatureScheme = 0x0603
 
+	// EdDSA algorithms.
+	Ed25519 SignatureScheme = 0x0807
+
 	// Legacy signature and hash algorithms for TLS 1.2.
+	PKCS1WithSHA1 SignatureScheme = 0x0201
 	ECDSAWithSHA1 SignatureScheme = 0x0203
 	SM2WITHSM3    SignatureScheme = 0x0204
 )
@@ -259,37 +365,32 @@ const (
 // guide certificate selection in the GetCertificate callback.
 type ClientHelloInfo struct {
 	// CipherSuites lists the CipherSuites supported by the client (e.g.
-	// TLS_RSA_WITH_RC4_128_SHA).
+	// TLS_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256).
 	CipherSuites []uint16
 
 	// ServerName indicates the name of the server requested by the client
 	// in order to support virtual hosting. ServerName is only set if the
-	// client is using SNI (see
-	// https://tools.ietf.org/html/rfc4366#section-3.1).
+	// client is using SNI (see RFC 4366, Section 3.1).
 	ServerName string
 
 	// SupportedCurves lists the elliptic curves supported by the client.
 	// SupportedCurves is set only if the Supported Elliptic Curves
-	// Extension is being used (see
-	// https://tools.ietf.org/html/rfc4492#section-5.1.1).
+	// Extension is being used (see RFC 4492, Section 5.1.1).
 	SupportedCurves []CurveID
 
 	// SupportedPoints lists the point formats supported by the client.
 	// SupportedPoints is set only if the Supported Point Formats Extension
-	// is being used (see
-	// https://tools.ietf.org/html/rfc4492#section-5.1.2).
+	// is being used (see RFC 4492, Section 5.1.2).
 	SupportedPoints []uint8
 
 	// SignatureSchemes lists the signature and hash schemes that the client
 	// is willing to verify. SignatureSchemes is set only if the Signature
-	// Algorithms Extension is being used (see
-	// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1).
+	// Algorithms Extension is being used (see RFC 5246, Section 7.4.1.4.1).
 	SignatureSchemes []SignatureScheme
 
 	// SupportedProtos lists the application protocols supported by the client.
 	// SupportedProtos is set only if the Application-Layer Protocol
-	// Negotiation Extension is being used (see
-	// https://tools.ietf.org/html/rfc7301#section-3.1).
+	// Negotiation Extension is being used (see RFC 7301, Section 3.1).
 	//
 	// Servers can select a protocol by setting Config.NextProtos in a
 	// GetConfigForClient return value.
@@ -334,6 +435,8 @@ type CertificateRequestInfo struct {
 // handshake and application data flow is not permitted so renegotiation can
 // only be used with protocols that synchronise with the renegotiation, such as
 // HTTPS.
+//
+// Renegotiation is not defined in TLS 1.3.
 type RenegotiationSupport int
 
 const (
@@ -444,7 +547,8 @@ type Config struct {
 	// If RootCAs is nil, TLS uses the host's root CA set.
 	RootCAs *x509.CertPool
 
-	// NextProtos is a list of supported, application level protocols.
+	// NextProtos is a list of supported application level protocols, in
+	// order of preference.
 	NextProtos []string
 
 	// ServerName is used to verify the hostname on the returned
@@ -470,8 +574,11 @@ type Config struct {
 	// This should be used only for testing.
 	InsecureSkipVerify bool
 
-	// CipherSuites is a list of supported cipher suites. If CipherSuites
-	// is nil, TLS uses a list of suites supported by the implementation.
+	// CipherSuites is a list of supported cipher suites for TLS versions up to
+	// TLS 1.2. If CipherSuites is nil, a default list of secure cipher suites
+	// is used, with a preference order based on hardware performance. The
+	// default cipher suites might change over Go versions. Note that TLS 1.3
+	// ciphersuites are not configurable.
 	CipherSuites []uint16
 
 	// PreferServerCipherSuites controls whether the server selects the
@@ -480,19 +587,19 @@ type Config struct {
 	// the order of elements in CipherSuites, is used.
 	PreferServerCipherSuites bool
 
-	// SessionTicketsDisabled may be set to true to disable session ticket
-	// (resumption) support. Note that on clients, session ticket support is
+	// SessionTicketsDisabled may be set to true to disable session ticket and
+	// PSK (resumption) support. Note that on clients, session ticket support is
 	// also disabled if ClientSessionCache is nil.
 	SessionTicketsDisabled bool
 
-	// SessionTicketKey is used by TLS servers to provide session
-	// resumption. See RFC 5077. If zero, it will be filled with
-	// random data before the first server handshake.
+	// SessionTicketKey is used by TLS servers to provide session resumption.
+	// See RFC 5077 and the PSK mode of RFC 8446. If zero, it will be filled
+	// with random data before the first server handshake.
 	//
 	// If multiple servers are terminating connections for the same host
 	// they should all have the same SessionTicketKey. If the
 	// SessionTicketKey leaks, previously recorded and future TLS
-	// connections using that key are compromised.
+	// connections using that key might be compromised.
 	SessionTicketKey [32]byte
 
 	// ClientSessionCache is a cache of ClientSessionState entries for TLS
@@ -505,12 +612,13 @@ type Config struct {
 
 	// MaxVersion contains the maximum SSL/TLS version that is acceptable.
 	// If zero, then the maximum version supported by this package is used,
-	// which is currently TLS 1.2.
+	// which is currently TLS 1.3.
 	MaxVersion uint16
 
 	// CurvePreferences contains the elliptic curves that will be used in
 	// an ECDHE handshake, in preference order. If empty, the default will
-	// be used.
+	// be used. The client will use the first preference as the type for
+	// its key share in TLS 1.3. This may change in the future.
 	CurvePreferences []CurveID
 
 	// DynamicRecordSizingDisabled disables adaptive sizing of TLS records.
@@ -565,6 +673,10 @@ func ticketKeyFromBytes(b [32]byte) (key ticketKey) {
 	copy(key.hmacKey[:], hashed[ticketKeyNameLen+16:ticketKeyNameLen+32])
 	return key
 }
+
+// maxSessionTicketLifetime is the maximum allowed lifetime of a TLS 1.3 session
+// ticket, and the lifetime we set for tickets we send.
+const maxSessionTicketLifetime = 7 * 24 * time.Hour
 
 // Clone returns a shallow clone of c. It is safe to clone a Config that is
 // being used concurrently by a TLS client or server.
@@ -696,6 +808,100 @@ func (c *Config) cipherSuites() []uint16 {
 	return s
 }
 
+var supportedVersions = []uint16{
+	//VersionTLS13,
+	VersionTLS12,
+	VersionTLS11,
+	VersionTLS10,
+	VersionSSL30,
+}
+
+func (c *Config) supportedVersions(isClient bool) []uint16 {
+	versions := make([]uint16, 0, len(supportedVersions))
+	for _, v := range supportedVersions {
+		// TLS 1.0 is the default minimum version.
+		if (c == nil || c.MinVersion == 0) && v < VersionTLS10 {
+			continue
+		}
+		if c != nil && c.MinVersion != 0 && v < c.MinVersion {
+			continue
+		}
+		if c != nil && c.MaxVersion != 0 && v > c.MaxVersion {
+			continue
+		}
+		// TLS 1.0 is the minimum version supported as a client.
+		if isClient && v < VersionTLS10 {
+			continue
+		}
+		// TLS 1.3 is opt-out in Go 1.13.
+		if v == VersionTLS13 && !isTLS13Supported() {
+			continue
+		}
+		versions = append(versions, v)
+	}
+	return versions
+}
+
+// tls13Support caches the result for isTLS13Supported.
+var tls13Support struct {
+	sync.Once
+	cached bool
+}
+
+// isTLS13Supported returns whether the program enabled TLS 1.3 by not opting
+// out with GODEBUG=tls13=0. It's cached after the first execution.
+func isTLS13Supported() bool {
+	tls13Support.Do(func() {
+		tls13Support.cached = goDebugString("tls13") != "0"
+	})
+	return tls13Support.cached
+}
+
+// goDebugString returns the value of the named GODEBUG key.
+// GODEBUG is of the form "key=val,key2=val2".
+func goDebugString(key string) string {
+	s := os.Getenv("GODEBUG")
+	for i := 0; i < len(s)-len(key)-1; i++ {
+		if i > 0 && s[i-1] != ',' {
+			continue
+		}
+		afterKey := s[i+len(key):]
+		if afterKey[0] != '=' || s[i:i+len(key)] != key {
+			continue
+		}
+		val := afterKey[1:]
+		for i, b := range val {
+			if b == ',' {
+				return val[:i]
+			}
+		}
+		return val
+	}
+	return ""
+}
+
+func (c *Config) maxSupportedVersion(isClient bool) uint16 {
+	supportedVersions := c.supportedVersions(isClient)
+	if len(supportedVersions) == 0 {
+		return 0
+	}
+	return supportedVersions[0]
+}
+
+// supportedVersionsFromMax returns a list of supported versions derived from a
+// legacy maximum version value. Note that only versions supported by this
+// library are returned. Any newer peer will use supportedVersions anyway.
+func supportedVersionsFromMax(maxVersion uint16) []uint16 {
+	versions := make([]uint16, 0, len(supportedVersions))
+	for _, v := range supportedVersions {
+		if v > maxVersion {
+			continue
+		}
+		versions = append(versions, v)
+	}
+	return versions
+}
+
 func (c *Config) minVersion() uint16 {
 	if c == nil || c.MinVersion == 0 {
 		return minVersion
@@ -721,17 +927,17 @@ func (c *Config) curvePreferences() []CurveID {
 
 // mutualVersion returns the protocol version to use given the advertised
 // version of the peer.
-func (c *Config) mutualVersion(vers uint16) (uint16, bool) {
-	minVersion := c.minVersion()
-	maxVersion := c.maxVersion()
-
-	if vers < minVersion {
-		return 0, false
+// 冲突的地方，以新版本进行替代
+func (c *Config) mutualVersion(isClient bool, peerVersions []uint16) (uint16, bool) {
+	supportedVersions := c.supportedVersions(isClient)
+	for _, peerVersion := range peerVersions {
+		for _, v := range supportedVersions {
+			if v == peerVersion {
+				return v, true
+			}
+		}
 	}
-	if vers > maxVersion {
-		vers = maxVersion
-	}
-	return vers, true
+	return 0, false
 }
 
 // getCertificate returns the best certificate for the given ClientHelloInfo,
@@ -785,9 +991,13 @@ func (c *Config) BuildNameToCertificate() {
 	c.NameToCertificate = make(map[string]*Certificate)
 	for i := range c.Certificates {
 		cert := &c.Certificates[i]
-		x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			continue
+		x509Cert := cert.Leaf
+		if x509Cert == nil {
+			var err error
+			x509Cert, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				continue
+			}
 		}
 		if len(x509Cert.Subject.CommonName) > 0 {
 			c.NameToCertificate[x509Cert.Subject.CommonName] = cert
@@ -798,8 +1008,17 @@ func (c *Config) BuildNameToCertificate() {
 	}
 }
 
+const (
+	keyLogLabelTLS12           = "CLIENT_RANDOM"
+	keyLogLabelClientHandshake = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelServerHandshake = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelClientTraffic   = "CLIENT_TRAFFIC_SECRET_0"
+	keyLogLabelServerTraffic   = "SERVER_TRAFFIC_SECRET_0"
+)
+
 // writeKeyLog logs client random and master secret if logging was enabled by
 // setting c.KeyLogWriter.
+// 冲突的地方，保留源码
 func (c *Config) writeKeyLog(clientRandom, masterSecret []byte) error {
 	if c.KeyLogWriter == nil {
 		return nil
@@ -821,11 +1040,10 @@ var writerMutex sync.Mutex
 // A Certificate is a chain of one or more certificates, leaf first.
 type Certificate struct {
 	Certificate [][]byte
-	// PrivateKey contains the private key corresponding to the public key
-	// in Leaf. For a server, this must implement crypto.Signer and/or
-	// crypto.Decrypter, with an RSA or ECDSA PublicKey. For a client
-	// (performing client authentication), this must be a crypto.Signer
-	// with an RSA or ECDSA PublicKey.
+	// PrivateKey contains the private key corresponding to the public key in
+	// Leaf. This must implement crypto.Signer with an RSA, ECDSA or Ed25519 PublicKey.
+	// For a server up to TLS 1.2, it can also implement crypto.Decrypter with
+	// an RSA PublicKey.
 	PrivateKey crypto.PrivateKey
 	// OCSPStaple contains an optional OCSP response which will be served
 	// to clients that request it.
@@ -882,9 +1100,14 @@ func (c *lruSessionCache) Put(sessionKey string, cs *ClientSessionState) {
 	defer c.Unlock()
 
 	if elem, ok := c.m[sessionKey]; ok {
-		entry := elem.Value.(*lruSessionCacheEntry)
-		entry.state = cs
-		c.q.MoveToFront(elem)
+		if cs == nil {
+			c.q.Remove(elem)
+			delete(c.m, sessionKey)
+		} else {
+			entry := elem.Value.(*lruSessionCacheEntry)
+			entry.state = cs
+			c.q.MoveToFront(elem)
+		}
 		return
 	}
 
@@ -932,6 +1155,7 @@ func defaultConfig() *Config {
 var (
 	once                   sync.Once
 	varDefaultCipherSuites []uint16
+	varDefaultCipherSuitesTLS13 []uint16
 )
 
 func defaultCipherSuites() []uint16 {
@@ -939,6 +1163,12 @@ func defaultCipherSuites() []uint16 {
 	return varDefaultCipherSuites
 }
 
+func defaultCipherSuitesTLS13() []uint16 {
+	once.Do(initDefaultCipherSuites)
+	return varDefaultCipherSuitesTLS13
+}
+
+// 冲突的地方，保留源码
 func initDefaultCipherSuites() {
 	// Without AES-GCM hardware, we put the ChaCha20-Poly1305
 	// cipher suites first.
@@ -991,6 +1221,8 @@ func signatureFromSignatureScheme(signatureAlgorithm SignatureScheme) uint8 {
 		return signatureRSAPSS
 	case ECDSAWithSHA1, ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512:
 		return signatureECDSA
+	case Ed25519:
+		return signatureEd25519
 	default:
 		return 0
 	}

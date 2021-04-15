@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"encoding/asn1"
 	"errors"
 	"io"
@@ -16,8 +15,6 @@ import (
 
 	"github.com/tjfoc/gmsm/sm2"
 	"github.com/tjfoc/gmsm/x509"
-
-	"golang.org/x/crypto/curve25519"
 )
 
 //// hashForServerKeyExchange hashes the given slices and returns their digest
@@ -56,16 +53,14 @@ import (
 // generates an ephemeral SM2 public/private key pair and signs it. The
 // pre-master secret is then calculated using ECDH.
 type ecdheKeyAgreementGM struct {
-	version    uint16
-	privateKey []byte
-	curveid    CurveID
+	version uint16
+	isRSA   bool
+	params  ecdheParameters
 
-	// publicKey is used to store the peer's public value when X25519 is
-	// being used.
-	publicKey []byte
-	// x and y are used to store the peer's public value when one of the
-	// NIST curves is being used.
-	x, y *big.Int
+	// ckx and preMasterSecret are generated in processServerKeyExchange
+	// and returned in generateClientKeyExchange.
+	ckx             *clientKeyExchangeMsg
+	preMasterSecret []byte
 }
 
 func (ka *ecdheKeyAgreementGM) generateServerKeyExchange(config *Config, signCert, cipherCert *Certificate,
@@ -209,7 +204,7 @@ func (ka *ecdheKeyAgreementGM) processServerKeyExchange(config *Config, clientHe
 	if skx.key[0] != 3 { // named curve
 		return errors.New("tls: server selected unsupported curve")
 	}
-	ka.curveid = CurveID(skx.key[1])<<8 | CurveID(skx.key[2])
+	curveID := CurveID(skx.key[1])<<8 | CurveID(skx.key[2])
 
 	publicLen := int(skx.key[3])
 	if publicLen+4 > len(skx.key) {
@@ -224,11 +219,25 @@ func (ka *ecdheKeyAgreementGM) processServerKeyExchange(config *Config, clientHe
 	}
 
 	//according to GMT0024, we don't care about
-	curve := sm2.P256Sm2()
-	ka.x, ka.y = elliptic.Unmarshal(curve, publicKey) // Unmarshal also checks whether the given point is on the curve
-	if ka.x == nil {
+	if _, ok := curveForCurveID(curveID); !ok {
+		return errors.New("tls: server selected unsupported curve")
+	}
+	params, err := generateGMParameters(config.Rand, curveID)
+	if err != nil {
+		return err
+	}
+	ka.params = params
+
+	ka.preMasterSecret = params.SharedKey(publicKey)
+	if ka.preMasterSecret == nil {
 		return errServerKeyExchange
 	}
+
+	ourPublicKey := params.PublicKey()
+	ka.ckx = new(clientKeyExchangeMsg)
+	ka.ckx.ciphertext = make([]byte, 1+len(ourPublicKey))
+	ka.ckx.ciphertext[0] = byte(len(ourPublicKey))
+	copy(ka.ckx.ciphertext[1:], ourPublicKey)
 
 	var signatureAlgorithm SignatureScheme
 	_, sigType, hashFunc, err := pickSignatureAlgorithm(cert.PublicKey, []SignatureScheme{signatureAlgorithm}, clientHello.supportedSignatureAlgorithms, ka.version)
@@ -239,55 +248,15 @@ func (ka *ecdheKeyAgreementGM) processServerKeyExchange(config *Config, clientHe
 	}
 	sig = sig[2:]
 
-	digest, err := hashForServerKeyExchange(sigType, hashFunc, ka.version, clientHello.random, serverHello.random, serverECDHParams)
-	if err != nil {
-		return err
-	}
-	return verifyHandshakeSignature(sigType, cert.PublicKey, hashFunc, digest, sig)
+	signed := hashForServerKeyExchange(sigType, hashFunc, ka.version, clientHello.random, serverHello.random, serverECDHParams)
+	return verifyHandshakeSignature(sigType, cert.PublicKey, hashFunc, signed, sig)
 }
 
 func (ka *ecdheKeyAgreementGM) generateClientKeyExchange(config *Config, clientHello *clientHelloMsg, cert *x509.Certificate) ([]byte, *clientKeyExchangeMsg, error) {
-	if ka.curveid == 0 {
+	if ka.ckx == nil {
 		return nil, nil, errors.New("tls: missing ServerKeyExchange message")
 	}
-
-	var serialized, preMasterSecret []byte
-
-	if ka.curveid == X25519 {
-		var ourPublic, theirPublic, sharedKey, scalar [32]byte
-
-		if _, err := io.ReadFull(config.rand(), scalar[:]); err != nil {
-			return nil, nil, err
-		}
-
-		copy(theirPublic[:], ka.publicKey)
-		curve25519.ScalarBaseMult(&ourPublic, &scalar)
-		curve25519.ScalarMult(&sharedKey, &scalar, &theirPublic)
-		serialized = ourPublic[:]
-		preMasterSecret = sharedKey[:]
-	} else {
-		curve, ok := curveForCurveID(ka.curveid)
-		if !ok {
-			panic("internal error")
-		}
-		priv, mx, my, err := elliptic.GenerateKey(curve, config.rand())
-		if err != nil {
-			return nil, nil, err
-		}
-		x, _ := curve.ScalarMult(ka.x, ka.y, priv)
-		preMasterSecret = make([]byte, (curve.Params().BitSize+7)>>3)
-		xBytes := x.Bytes()
-		copy(preMasterSecret[len(preMasterSecret)-len(xBytes):], xBytes)
-
-		serialized = elliptic.Marshal(curve, mx, my)
-	}
-
-	ckx := new(clientKeyExchangeMsg)
-	ckx.ciphertext = make([]byte, 1+len(serialized))
-	ckx.ciphertext[0] = byte(len(serialized))
-	copy(ckx.ciphertext[1:], serialized)
-
-	return preMasterSecret, ckx, nil
+	return ka.preMasterSecret, ka.ckx, nil
 }
 
 // eccKeyAgreementGM implements a TLS key agreement where the server

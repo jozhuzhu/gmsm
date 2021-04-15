@@ -28,16 +28,79 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"fmt"
+	"github.com/tjfoc/gmsm/sm2"
 	"hash"
 	"math/big"
 	"reflect"
-
-	"github.com/tjfoc/gmsm/sm2"
 )
 
-/*
- * reference to RFC5959 and RFC2898
- */
+// pkcs8 reflects an ASN.1, PKCS#8 PrivateKey. See
+// ftp://ftp.rsasecurity.com/pub/pkcs/pkcs-8/pkcs-8v1_2.asn
+// and RFC 5208.
+type pkcs8 struct {
+	Version    int
+	Algo       pkix.AlgorithmIdentifier
+	PrivateKey []byte
+	// optional attributes omitted.
+}
+
+// ParsePKCS8UnencryptedPrivateKey parses an unencrypted private key in PKCS#8, ASN.1 DER form.
+//
+// It returns a *rsa.PrivateKey, a *ecdsa.PrivateKey, or a ed25519.PrivateKey.
+// More types might be supported in the future.
+//
+// This kind of key is commonly encoded in PEM blocks of type "PRIVATE KEY".
+func ParsePKCS8UnencryptedPrivateKey(der []byte) (*sm2.PrivateKey, error) {
+	var privKey pkcs8
+	if _, err := asn1.Unmarshal(der, &privKey); err != nil {
+		if _, err := asn1.Unmarshal(der, &ecPrivateKey{}); err == nil {
+			return nil, errors.New("x509: failed to parse private key (use ParseECPrivateKey instead for this key format)")
+		}
+		if _, err := asn1.Unmarshal(der, &pkcs1PrivateKey{}); err == nil {
+			return nil, errors.New("x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)")
+		}
+		return nil, err
+	}
+	switch {
+	//case privKey.Algo.Algorithm.Equal(oidPublicKeyRSA):
+	//	key, err = ParsePKCS1PrivateKey(privKey.PrivateKey)
+	//	if err != nil {
+	//		return nil, errors.New("x509: failed to parse RSA private key embedded in PKCS#8: " + err.Error())
+	//	}
+	//	return key, nil
+	//
+	//case privKey.Algo.Algorithm.Equal(oidPublicKeyECDSA):
+	//	bytes := privKey.Algo.Parameters.FullBytes
+	//	namedCurveOID := new(asn1.ObjectIdentifier)
+	//	if _, err := asn1.Unmarshal(bytes, namedCurveOID); err != nil {
+	//		namedCurveOID = nil
+	//	}
+	//	key, err = parseECPrivateKey(namedCurveOID, privKey.PrivateKey)
+	//	if err != nil {
+	//		return nil, errors.New("x509: failed to parse EC private key embedded in PKCS#8: " + err.Error())
+	//	}
+	//	return key, nil
+	//
+	//case privKey.Algo.Algorithm.Equal(oidPublicKeyEd25519):
+	//	if l := len(privKey.Algo.Parameters.FullBytes); l != 0 {
+	//		return nil, errors.New("x509: invalid Ed25519 private key parameters")
+	//	}
+	//	var curvePrivateKey []byte
+	//	if _, err := asn1.Unmarshal(privKey.PrivateKey, &curvePrivateKey); err != nil {
+	//		return nil, fmt.Errorf("x509: invalid Ed25519 private key: %v", err)
+	//	}
+	//	if l := len(curvePrivateKey); l != ed25519.SeedSize {
+	//		return nil, fmt.Errorf("x509: invalid Ed25519 private key length: %d", l)
+	//	}
+	//	return ed25519.NewKeyFromSeed(curvePrivateKey), nil
+
+	case privKey.Algo.Algorithm.Equal(oidSM2):
+		return ParseSm2PrivateKey(privKey.PrivateKey)
+	default:
+		return nil, fmt.Errorf("x509: PKCS#8 wrapping contained private key with unknown algorithm: %v", privKey.Algo.Algorithm)
+	}
+}
 
 var (
 	oidPBES1  = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 3}  // pbeWithMD5AndDES-CBC(PBES1)
@@ -103,12 +166,6 @@ type sm2PrivateKey struct {
 	PrivateKey    []byte
 	NamedCurveOID asn1.ObjectIdentifier `asn1:"optional,explicit,tag:0"`
 	PublicKey     asn1.BitString        `asn1:"optional,explicit,tag:1"`
-}
-
-type pkcs8 struct {
-	Version    int
-	Algo       pkix.AlgorithmIdentifier
-	PrivateKey []byte
 }
 
 // copy from crypto/pbkdf2.go
@@ -212,18 +269,6 @@ func ParseSm2PrivateKey(der []byte) (*sm2.PrivateKey, error) {
 	return priv, nil
 }
 
-func ParsePKCS8UnecryptedPrivateKey(der []byte) (*sm2.PrivateKey, error) {
-	var privKey pkcs8
-
-	if _, err := asn1.Unmarshal(der, &privKey); err != nil {
-		return nil, err
-	}
-	if !reflect.DeepEqual(privKey.Algo.Algorithm, oidSM2) {
-		return nil, errors.New("x509: not sm2 elliptic curve")
-	}
-	return ParseSm2PrivateKey(privKey.PrivateKey)
-}
-
 func ParsePKCS8EcryptedPrivateKey(der, pwd []byte) (*sm2.PrivateKey, error) {
 	var keyInfo EncryptedPrivateKeyInfo
 
@@ -271,19 +316,11 @@ func ParsePKCS8EcryptedPrivateKey(der, pwd []byte) (*sm2.PrivateKey, error) {
 	}
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(encryptedKey, encryptedKey)
-	rKey, err := ParsePKCS8UnecryptedPrivateKey(encryptedKey)
+	rKey, err := ParsePKCS8UnencryptedPrivateKey(encryptedKey)
 	if err != nil {
 		return nil, errors.New("pkcs8: incorrect password")
 	}
 	return rKey, nil
-}
-
-func ParsePKCS8PrivateKey(der, pwd []byte) (*sm2.PrivateKey, error) {
-	if pwd == nil {
-
-		return ParsePKCS8UnecryptedPrivateKey(der)
-	}
-	return ParsePKCS8EcryptedPrivateKey(der, pwd)
 }
 
 func MarshalSm2UnecryptedPrivateKey(key *sm2.PrivateKey) ([]byte, error) {
@@ -368,4 +405,12 @@ func MarshalSm2PrivateKey(key *sm2.PrivateKey, pwd []byte) ([]byte, error) {
 		return MarshalSm2UnecryptedPrivateKey(key)
 	}
 	return MarshalSm2EcryptedPrivateKey(key, pwd)
+}
+
+func ParsePKCS8PrivateKey(der, pwd []byte) (*sm2.PrivateKey, error) {
+	if pwd == nil {
+
+		return ParsePKCS8UnencryptedPrivateKey(der)
+	}
+	return ParsePKCS8EcryptedPrivateKey(der, pwd)
 }

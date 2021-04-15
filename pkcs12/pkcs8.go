@@ -12,8 +12,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
-	"github.com/tjfoc/gmsm/sm2"
 	"fmt"
+	"github.com/tjfoc/gmsm/sm2"
 	"math/big"
 )
 

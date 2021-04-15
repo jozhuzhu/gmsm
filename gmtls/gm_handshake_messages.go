@@ -5,24 +5,15 @@
 
 package gmtls
 
-import "bytes"
-
 type certificateRequestMsgGM struct {
 	raw []byte
+	// hasSignatureAlgorithm indicates whether this message includes a list of
+	// supported signature algorithms. This change was introduced with TLS 1.2.
+	hasSignatureAlgorithm bool
 
+	supportedSignatureAlgorithms []SignatureScheme
 	certificateTypes             []byte
 	certificateAuthorities       [][]byte
-}
-
-func (m *certificateRequestMsgGM) equal(i interface{}) bool {
-	m1, ok := i.(*certificateRequestMsgGM)
-	if !ok {
-		return false
-	}
-
-	return bytes.Equal(m.raw, m1.raw) &&
-		bytes.Equal(m.certificateTypes, m1.certificateTypes) &&
-		eqByteSlices(m.certificateAuthorities, m1.certificateAuthorities)
 }
 
 func (m *certificateRequestMsgGM) marshal() (x []byte) {
@@ -30,13 +21,17 @@ func (m *certificateRequestMsgGM) marshal() (x []byte) {
 		return m.raw
 	}
 
-	// See https://tools.ietf.org/html/rfc4346#section-7.4.4
+	// See RFC 4346, Section 7.4.4.
 	length := 1 + len(m.certificateTypes) + 2
 	casLength := 0
 	for _, ca := range m.certificateAuthorities {
 		casLength += 2 + len(ca)
 	}
 	length += casLength
+
+	if m.hasSignatureAlgorithm {
+		length += 2 + 2*len(m.supportedSignatureAlgorithms)
+	}
 
 	x = make([]byte, 4+length)
 	x[0] = typeCertificateRequest
@@ -48,6 +43,18 @@ func (m *certificateRequestMsgGM) marshal() (x []byte) {
 
 	copy(x[5:], m.certificateTypes)
 	y := x[5+len(m.certificateTypes):]
+
+	if m.hasSignatureAlgorithm {
+		n := len(m.supportedSignatureAlgorithms) * 2
+		y[0] = uint8(n >> 8)
+		y[1] = uint8(n)
+		y = y[2:]
+		for _, sigAlgo := range m.supportedSignatureAlgorithms {
+			y[0] = uint8(sigAlgo >> 8)
+			y[1] = uint8(sigAlgo)
+			y = y[2:]
+		}
+	}
 
 	y[0] = uint8(casLength >> 8)
 	y[1] = uint8(casLength)
@@ -88,6 +95,26 @@ func (m *certificateRequestMsgGM) unmarshal(data []byte) bool {
 	}
 
 	data = data[numCertTypes:]
+
+	if m.hasSignatureAlgorithm {
+		if len(data) < 2 {
+			return false
+		}
+		sigAndHashLen := uint16(data[0])<<8 | uint16(data[1])
+		data = data[2:]
+		if sigAndHashLen&1 != 0 {
+			return false
+		}
+		if len(data) < int(sigAndHashLen) {
+			return false
+		}
+		numSigAlgos := sigAndHashLen / 2
+		m.supportedSignatureAlgorithms = make([]SignatureScheme, numSigAlgos)
+		for i := range m.supportedSignatureAlgorithms {
+			m.supportedSignatureAlgorithms[i] = SignatureScheme(data[0])<<8 | SignatureScheme(data[1])
+			data = data[2:]
+		}
+	}
 
 	if len(data) < 2 {
 		return false

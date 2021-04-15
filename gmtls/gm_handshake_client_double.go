@@ -12,12 +12,10 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"io"
-	"strconv"
-	"sync/atomic"
-
 	"github.com/tjfoc/gmsm/sm2"
 	"github.com/tjfoc/gmsm/x509"
+	"io"
+	"sync/atomic"
 )
 
 type clientHandshakeStateGM struct {
@@ -30,67 +28,94 @@ type clientHandshakeStateGM struct {
 	session      *ClientSessionState
 }
 
-func makeClientHelloGM(config *Config) (*clientHelloMsg, error) {
+func (c *Conn) makeClientHelloGM() (*clientHelloMsg, ecdheParameters, error) {
+	config := c.config
 	if len(config.ServerName) == 0 && !config.InsecureSkipVerify {
-		return nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
+		return nil, nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
 
-	hello := &clientHelloMsg{
-		vers:               config.GMSupport.GetVersion(),
-		compressionMethods: []uint8{compressionNone},
-		random:             make([]byte, 32),
+	nextProtosLength := 0
+	for _, proto := range config.NextProtos {
+		if l := len(proto); l == 0 || l > 255 {
+			return nil, nil, errors.New("tls: invalid NextProtos value")
+		} else {
+			nextProtosLength += 1 + l
+		}
+	}
+
+	if nextProtosLength > 0xffff {
+		return nil, nil, errors.New("tls: NextProtos values too large")
 	}
 	possibleCipherSuites := getCipherSuites(config)
+
+	hello := &clientHelloMsg{
+		vers:                         VersionGMSSL,
+		compressionMethods:           []uint8{compressionNone},
+		random:                       make([]byte, 32),
+		sessionId:                    make([]byte, 32),
+		supportedVersions:			  []uint16{VersionGMSSL},
+	}
+
+	if c.handshakes > 0 {
+		hello.secureRenegotiation = c.clientFinished[:]
+	}
+
+
 	hello.cipherSuites = make([]uint16, 0, len(possibleCipherSuites))
 
-NextCipherSuite:
 	for _, suiteId := range possibleCipherSuites {
 		for _, suite := range config.GMSupport.cipherSuites() {
 			if suite.id != suiteId {
 				continue
 			}
+			// Don't advertise TLS 1.2-only cipher suites unless
+			// we're attempting TLS 1.2.
+			if hello.vers < VersionTLS12 && suite.flags&suiteTLS12 != 0 {
+				break
+			}
 			hello.cipherSuites = append(hello.cipherSuites, suiteId)
-			continue NextCipherSuite
+			break
 		}
 	}
 
 	_, err := io.ReadFull(config.rand(), hello.random)
 	if err != nil {
-		return nil, errors.New("tls: short read from Rand: " + err.Error())
+		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
 	}
 
-	return hello, nil
+	// A random session ID is used to detect when the server accepted a ticket
+	// and is resuming a session (see RFC 5077). In TLS 1.3, it's always set as
+	// a compatibility measure (see RFC 8446, Section 4.1.2).
+	if _, err := io.ReadFull(config.rand(), hello.sessionId); err != nil {
+		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
+	}
+
+	if hello.vers >= VersionTLS12 {
+		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms
+	}
+
+	var params ecdheParameters
+	if hello.supportedVersions[0] == VersionTLS13 {
+		hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13()...)
+
+		curveID := config.curvePreferences()[0]
+		if _, ok := curveForCurveID(curveID); curveID != X25519 && !ok {
+			return nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
+		}
+		params, err = generateECDHEParameters(config.rand(), curveID)
+		if err != nil {
+			return nil, nil, err
+		}
+		hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
+	}
+
+	return hello, params, nil
 }
 
 // Does the handshake, either a full one or resumes old session.
 // Requires hs.c, hs.hello, and, optionally, hs.session to be set.
 func (hs *clientHandshakeStateGM) handshake() error {
 	c := hs.c
-
-	// send ClientHello
-	if _, err := c.writeRecord(recordTypeHandshake, hs.hello.marshal()); err != nil {
-		return err
-	}
-
-	msg, err := c.readHandshake()
-	if err != nil {
-		return err
-	}
-
-	var ok bool
-	if hs.serverHello, ok = msg.(*serverHelloMsg); !ok {
-		c.sendAlert(alertUnexpectedMessage)
-		return unexpectedMessageError(hs.serverHello, msg)
-	}
-
-	if hs.serverHello.vers != VersionGMSSL {
-		hs.c.sendAlert(alertProtocolVersion)
-		return fmt.Errorf("tls: server selected unsupported protocol version %x, while expecting %x", hs.serverHello.vers, VersionGMSSL)
-	}
-
-	if err = hs.pickCipherSuite(); err != nil {
-		return err
-	}
 
 	isResume, err := hs.processServerHello()
 	if err != nil {
@@ -190,8 +215,6 @@ func (hs *clientHandshakeStateGM) doFullHandshake() error {
 	hs.finishedHash.Write(certMsg.marshal())
 
 	if c.handshakes == 0 {
-		// If this is the first handshake on a connection, process and
-		// (optionally) verify the server's certificates.
 		certs := make([]*x509.Certificate, len(certMsg.certificates))
 		for i, asn1Data := range certMsg.certificates {
 			cert, err := x509.ParseCertificate(asn1Data)
@@ -286,6 +309,30 @@ func (hs *clientHandshakeStateGM) doFullHandshake() error {
 		return err
 	}
 
+	// 以下分支是新版本中的内容，尝试看看能否使用
+	cs, ok := msg.(*certificateStatusMsg)
+	if ok {
+		// RFC4366 on Certificate Status Request:
+		// The server MAY return a "certificate_status" message.
+
+		if !hs.serverHello.ocspStapling {
+			// If a server returns a "CertificateStatus" message, then the
+			// server MUST have included an extension of type "status_request"
+			// with empty "extension_data" in the extended server hello.
+
+			c.sendAlert(alertUnexpectedMessage)
+			return errors.New("tls: received unexpected CertificateStatus message")
+		}
+		hs.finishedHash.Write(cs.marshal())
+
+		c.ocspResponse = cs.response
+
+		msg, err = c.readHandshake()
+		if err != nil {
+			return err
+		}
+	}
+
 	keyAgreement := hs.suite.ka(c.vers)
 	if ka, ok := keyAgreement.(*eccKeyAgreementGM); ok {
 		ka.encipherCert = c.peerCertificates[1]
@@ -313,7 +360,11 @@ func (hs *clientHandshakeStateGM) doFullHandshake() error {
 		certRequested = true
 		hs.finishedHash.Write(certReq.marshal())
 
-		if chainToSend, err = hs.getCertificate(certReq); err != nil {
+		cri := certificateRequestGMInfoFromMsg(certReq)
+
+		cri.SignatureSchemes = append(cri.SignatureSchemes, SM2WITHSM3)
+
+		if chainToSend, err = c.getClientCertificateGM(cri); err != nil {
 			c.sendAlert(alertInternalError)
 			return err
 		}
@@ -356,12 +407,25 @@ func (hs *clientHandshakeStateGM) doFullHandshake() error {
 	}
 
 	if chainToSend != nil && len(chainToSend.Certificate) > 0 {
-		certVerify := &certificateVerifyMsg{}
+		certVerify := &certificateVerifyMsg{
+			hasSignatureAlgorithm: c.vers >= VersionTLS12,
+		}
 
 		key, ok := chainToSend.PrivateKey.(crypto.Signer)
 		if !ok {
 			c.sendAlert(alertInternalError)
 			return fmt.Errorf("tls: client certificate private key of type %T does not implement crypto.Signer", chainToSend.PrivateKey)
+		}
+
+		// 以下内容其实与handshake_client.go差不多，只是更加明确是用国密的算法来实现
+		signatureAlgorithm, _, _, err := pickSignatureAlgorithm(key.Public(), certReq.supportedSignatureAlgorithms, supportedSignatureAlgorithmsTLS12, c.vers)
+		if err != nil {
+			c.sendAlert(alertInternalError)
+			return err
+		}
+		// SignatureAndHashAlgorithm was introduced in TLS 1.2.
+		if certVerify.hasSignatureAlgorithm {
+			certVerify.signatureAlgorithm = signatureAlgorithm
 		}
 
 		digest := hs.finishedHash.client.Sum(nil)
@@ -420,6 +484,10 @@ func (hs *clientHandshakeStateGM) serverResumedSession() bool {
 
 func (hs *clientHandshakeStateGM) processServerHello() (bool, error) {
 	c := hs.c
+
+	if err := hs.pickCipherSuite(); err != nil {
+		return false, err
+	}
 
 	if hs.serverHello.compressionMethod != compressionNone {
 		c.sendAlert(alertUnexpectedMessage)
@@ -494,9 +562,8 @@ func (hs *clientHandshakeStateGM) processServerHello() (bool, error) {
 func (hs *clientHandshakeStateGM) readFinished(out []byte) error {
 	c := hs.c
 
-	c.readRecord(recordTypeChangeCipherSpec)
-	if c.in.err != nil {
-		return c.in.err
+	if err := c.readChangeCipherSpec(); err != nil {
+		return err
 	}
 
 	msg, err := c.readHandshake()
@@ -544,6 +611,7 @@ func (hs *clientHandshakeStateGM) readSessionTicket() error {
 		masterSecret:       hs.masterSecret,
 		serverCertificates: c.peerCertificates,
 		verifiedChains:     c.verifiedChains,
+		receivedAt:         c.config.time(),
 	}
 
 	return nil
@@ -591,74 +659,54 @@ func (hs *clientHandshakeStateGM) sendFinished(out []byte) error {
 //	tls11SignatureSchemesNumRSA = 4
 //)
 
-func (hs *clientHandshakeStateGM) getCertificate(certReq *certificateRequestMsgGM) (*Certificate, error) {
-	c := hs.c
-
-	if c.config.GetClientCertificate != nil {
-		var signatureSchemes []SignatureScheme
-
-		return c.config.GetClientCertificate(&CertificateRequestInfo{
-			AcceptableCAs:    certReq.certificateAuthorities,
-			SignatureSchemes: signatureSchemes,
-		})
+// certificateRequestInfoFromMsg generates a CertificateRequestInfo from a TLS
+// <= 1.2 CertificateRequest, making an effort to fill in missing information.
+func certificateRequestGMInfoFromMsg(certReq *certificateRequestMsgGM) *CertificateRequestInfo {
+	var rsaAvail, ecAvail bool
+	for _, certType := range certReq.certificateTypes {
+		switch certType {
+		case certTypeRSASign:
+			rsaAvail = true
+		case certTypeECDSASign:
+			ecAvail = true
+		}
 	}
 
-	// RFC 4346 on the certificateAuthorities field: A list of the
-	// distinguished names of acceptable certificate authorities.
-	// These distinguished names may specify a desired
-	// distinguished name for a root CA or for a subordinate CA;
-	// thus, this message can be used to describe both known roots
-	// and a desired authorization space. If the
-	// certificate_authorities list is empty then the client MAY
-	// send any certificate of the appropriate
-	// ClientCertificateType, unless there is some external
-	// arrangement to the contrary.
+	cri := &CertificateRequestInfo{
+		AcceptableCAs: certReq.certificateAuthorities,
+	}
 
-	// We need to search our list of client certs for one
-	// where SignatureAlgorithm is acceptable to the server and the
-	// Issuer is in certReq.certificateAuthorities
-findCert:
-	for i, chain := range c.config.Certificates {
+	if !certReq.hasSignatureAlgorithm {
+		// Prior to TLS 1.2, the signature schemes were not
+		// included in the certificate request message. In this
+		// case we use a plausible list based on the acceptable
+		// certificate types.
+		switch {
+		case rsaAvail && ecAvail:
+			cri.SignatureSchemes = tls11SignatureSchemes
+		case rsaAvail:
+			cri.SignatureSchemes = tls11SignatureSchemesRSA
+		case ecAvail:
+			cri.SignatureSchemes = tls11SignatureSchemesECDSA
+		}
+		return cri
+	}
 
-		for j, cert := range chain.Certificate {
-			x509Cert := chain.Leaf
-			// parse the certificate if this isn't the leaf
-			// node, or if chain.Leaf was nil
-			if j != 0 || x509Cert == nil {
-				var err error
-				if x509Cert, err = x509.ParseCertificate(cert); err != nil {
-					c.sendAlert(alertInternalError)
-					return nil, errors.New("tls: failed to parse client certificate #" + strconv.Itoa(i) + ": " + err.Error())
-				}
+	// Filter the signature schemes based on the certificate types.
+	// See RFC 5246, Section 7.4.4 (where it calls this "somewhat complicated").
+	cri.SignatureSchemes = make([]SignatureScheme, 0, len(certReq.supportedSignatureAlgorithms))
+	for _, sigScheme := range certReq.supportedSignatureAlgorithms {
+		switch signatureFromSignatureScheme(sigScheme) {
+		case signatureECDSA, signatureEd25519:
+			if ecAvail {
+				cri.SignatureSchemes = append(cri.SignatureSchemes, sigScheme)
 			}
-
-			var isGMCert bool
-
-			if x509Cert.PublicKeyAlgorithm == x509.ECDSA {
-				pubKey, ok := x509Cert.PublicKey.(*ecdsa.PublicKey)
-				if ok && pubKey.Curve == sm2.P256Sm2() {
-					isGMCert = true
-				}
-			}
-
-			if !isGMCert {
-				continue findCert
-			}
-
-			if len(certReq.certificateAuthorities) == 0 {
-				// they gave us an empty list, so just take the
-				// first cert from c.config.Certificates
-				return &chain, nil
-			}
-
-			for _, ca := range certReq.certificateAuthorities {
-				if bytes.Equal(x509Cert.RawIssuer, ca) {
-					return &chain, nil
-				}
+		case signatureRSAPSS, signaturePKCS1v15:
+			if rsaAvail {
+				cri.SignatureSchemes = append(cri.SignatureSchemes, sigScheme)
 			}
 		}
 	}
 
-	// No acceptable certificate found. Don't send a certificate.
-	return new(Certificate), nil
+	return cri
 }

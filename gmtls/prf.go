@@ -48,12 +48,8 @@ func pHash(result, secret, seed []byte, hash func() hash.Hash) {
 		h.Write(a)
 		h.Write(seed)
 		b := h.Sum(nil)
-		todo := len(b)
-		if j+todo > len(result) {
-			todo = len(result) - j
-		}
-		copy(result[j:j+todo], b)
-		j += todo
+		copy(result[j:], b)
+		j += len(b)
 
 		h.Reset()
 		h.Write(a)
@@ -125,7 +121,6 @@ func prf30(result, secret, label, seed []byte) {
 }
 
 const (
-	tlsRandomLength      = 32 // Length of a random nonce in TLS 1.1.
 	masterSecretLength   = 48 // Length of a master secret in TLS 1.1.
 	finishedVerifyLength = 12 // Length of verify_data in a Finished message.
 )
@@ -166,7 +161,7 @@ func prfForVersion(version uint16, suite *cipherSuite) func(result, secret, labe
 }
 
 // masterFromPreMasterSecret generates the master secret from the pre-master
-// secret. See http://tools.ietf.org/html/rfc5246#section-8.1
+// secret. See RFC 5246, Section 8.1.
 func masterFromPreMasterSecret(version uint16, suite *cipherSuite, preMasterSecret, clientRandom, serverRandom []byte) []byte {
 	seed := make([]byte, 0, len(clientRandom)+len(serverRandom))
 	seed = append(seed, clientRandom...)
@@ -202,9 +197,9 @@ func keysFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clie
 	return
 }
 
-// lookupTLSHash looks up the corresponding crypto.Hash for a given
-// TLS hash identifier.
-func lookupTLSHash(signatureAlgorithm SignatureScheme) (crypto.Hash, error) {
+// hashFromSignatureScheme returns the corresponding crypto.Hash for a given
+// hash from a TLS SignatureScheme.
+func hashFromSignatureScheme(signatureAlgorithm SignatureScheme) (crypto.Hash, error) {
 	switch signatureAlgorithm {
 	case PKCS1WithSHA1, ECDSAWithSHA1:
 		return crypto.SHA1, nil
@@ -214,6 +209,8 @@ func lookupTLSHash(signatureAlgorithm SignatureScheme) (crypto.Hash, error) {
 		return crypto.SHA384, nil
 	case PKCS1WithSHA512, PSSWithSHA512, ECDSAWithP521AndSHA512:
 		return crypto.SHA512, nil
+	case Ed25519:
+		return directSigning, nil
 	default:
 		return 0, fmt.Errorf("tls: unsupported signature algorithm: %#04x", signatureAlgorithm)
 	}
@@ -228,7 +225,7 @@ func newFinishedHash(version uint16, cipherSuite *cipherSuite) finishedHash {
 
 	if version == VersionGMSSL {
 		prf = prfAndHashForGM()
-		return finishedHash{sm3.New(), sm3.New(), nil, nil, buffer, version, prf}
+		return finishedHash{sm3.New(), sm3.New(), new(nilMD5Hash), new(nilMD5Hash), buffer, version, prf}
 	} else {
 		prf, hash := prfAndHashForVersion(version, cipherSuite)
 		if hash != 0 {
@@ -341,11 +338,11 @@ func (h finishedHash) serverSum(masterSecret []byte) []byte {
 	return out
 }
 
-// hashForClientCertificate returns a digest, hash function, and TLS 1.2 hash
-// id suitable for signing by a TLS client certificate.
+// hashForClientCertificate returns the handshake messages so far, pre-hashed if
+// necessary, suitable for signing by a TLS client certificate.
 func (h finishedHash) hashForClientCertificate(sigType uint8, hashAlg crypto.Hash, masterSecret []byte) ([]byte, error) {
-	if (h.version == VersionSSL30 || h.version >= VersionTLS12) && h.buffer == nil {
-		panic("a handshake hash for a client-certificate was requested after discarding the handshake buffer")
+	if (h.version == VersionSSL30 || h.version >= VersionTLS12 || sigType == signatureEd25519) && h.buffer == nil {
+		panic("tls: handshake hash for a client certificate requested after discarding the handshake buffer")
 	}
 
 	if h.version == VersionSSL30 {
@@ -359,6 +356,11 @@ func (h finishedHash) hashForClientCertificate(sigType uint8, hashAlg crypto.Has
 		sha1Hash.Write(h.buffer)
 		return finishedSum30(md5Hash, sha1Hash, masterSecret, nil), nil
 	}
+
+	if sigType == signatureEd25519 {
+		return h.buffer, nil
+	}
+
 	if h.version >= VersionTLS12 {
 		hash := hashAlg.New()
 		hash.Write(h.buffer)
@@ -385,8 +387,7 @@ func noExportedKeyingMaterial(label string, context []byte, length int) ([]byte,
 	return nil, errors.New("crypto/tls: ExportKeyingMaterial is unavailable when renegotiation is enabled")
 }
 
-// ekmFromMasterSecret generates exported keying material as defined in
-// https://tools.ietf.org/html/rfc5705.
+// ekmFromMasterSecret generates exported keying material as defined in RFC 5705.
 func ekmFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clientRandom, serverRandom []byte) func(string, []byte, int) ([]byte, error) {
 	return func(label string, context []byte, length int) ([]byte, error) {
 		switch label {

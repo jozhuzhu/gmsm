@@ -49,6 +49,8 @@ const (
 	alertInappropriateFallback  alert = 86
 	alertUserCanceled           alert = 90
 	alertNoRenegotiation        alert = 100
+	alertMissingExtension       alert = 109
+	alertUnsupportedExtension   alert = 110
 	alertNoApplicationProtocol  alert = 120
 	//GMT0024
 	alertUnspporttedSite2Site   alert = 200
@@ -83,6 +85,8 @@ var alertText = map[alert]string{
 	alertInappropriateFallback:  "inappropriate fallback",
 	alertUserCanceled:           "user canceled",
 	alertNoRenegotiation:        "no renegotiation",
+	alertMissingExtension:       "missing extension",
+	alertUnsupportedExtension:   "unsupported extension",
 	alertNoApplicationProtocol:  "no application protocol",
 	//GMT0024
 	alertUnspporttedSite2Site:   "不支持site2site",
