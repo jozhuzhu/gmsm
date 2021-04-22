@@ -9,9 +9,13 @@ package gmtls
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"github.com/tjfoc/gmsm/sm2"
+	"github.com/tjfoc/gmsm/x509"
 	"io"
 	"sync/atomic"
 )

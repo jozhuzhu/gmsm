@@ -234,15 +234,15 @@ func (hs *serverHandshakeStateGM) processClientHello() error {
 		}
 	}
 
-	hs.cert, err = c.config.getCertificate(hs.clientHelloInfo())
+	hs.cert, err = c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
 	if err != nil {
 		c.sendAlert(alertInternalError)
-		return false, err
+		return err
 	}
 
 	if len(hs.cert.Certificate) < 1 {
 		c.sendAlert(alertInternalError)
-		return false, fmt.Errorf("tls: amount of server certificates must be greater than 0")
+		return fmt.Errorf("tls: amount of server certificates must be greater than 0")
 	}
 
 	if err != nil {
